@@ -1,63 +1,126 @@
-package slca
+// Package requestcache provides functions for caching on-demand generated data.
+package requestcache
 
 import (
-	"crypto/md5"
 	"encoding/gob"
-	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
 
-	"bitbucket.org/ctessum/slca/greet"
-	"bitbucket.org/ctessum/sparse"
-
 	"github.com/golang/groupcache/lru"
+
+	"golang.org/x/net/context"
 )
 
-type request struct {
-	edge       *greet.ResultEdge
-	results    *greet.Results
-	result     interface{}
-	returnChan chan *request
-	err        error
-	funcs      []func(*request)
-	key        string
+type Cache struct {
+	// requestChan receives incoming requests.
+	requestChan chan *Request
+
+	// requests holds the number of requests each individual cache has recieved.
+	requests    []int
+	requestLock sync.RWMutex
 }
 
-func newRequest(r *greet.Results, e *greet.ResultEdge) (*request, error) {
-	var key string
-	p := r.GetFromNode(e).Process
-	switch t := p.(type) {
-	case *greet.StationaryProcess:
-		sp := p.(*greet.StationaryProcess)
-		if sp.SpatialRef == nil {
-			return nil, fmt.Errorf("stationary process %s (id=%s) has no SpatialRef", sp.Name, sp.ID)
-		}
-		key = fmt.Sprintf("%x", md5.Sum([]byte(sp.SpatialRef.Key())))
-	case *greet.TransportationProcess:
-		key = "transportation"
-	case *greet.Mix:
-		key = "NoSpatial"
-	default:
-		return nil, fmt.Errorf("in slca.newRequest: can't make key for type %v", t)
+// NewCache creates a new set of caches for on-demand generated content, where
+// processor is the function that creates the content and cachefuncs are the
+// caches, listed in order of priority.
+func NewCache(processor ProcessFunc, cachefuncs ...CacheFunc) *Cache {
+	c := &Cache{
+		requestChan: make(chan *Request),
+		requests:    make([]int, len(cachefuncs)+1),
 	}
 
-	return &request{
-		edge:       e,
-		results:    r,
-		returnChan: make(chan *request),
-		key:        key,
-	}, nil
+	in := c.requestChan
+	out := in
+	for i, cf := range cachefuncs {
+
+		intermediate := make(chan *Request)
+		go func(in chan *Request, i int) {
+			// Track the number of requests received by this cache.
+			for req := range in {
+				c.requestLock.Lock()
+				c.requests[i]++
+				c.requestLock.Unlock()
+				intermediate <- req
+			}
+		}(in, i)
+
+		out = cf(intermediate)
+		in = out
+	}
+	go func() {
+		for req := range out {
+			// Process the results
+			c.requestLock.Lock()
+			c.requests[len(cachefuncs)]++
+			c.requestLock.Unlock()
+			req.resultPayload, req.err = processor(req.ctx, req.requestPayload)
+			req.returnChan <- req
+		}
+	}()
+
+	return c
 }
 
-// finalize runs all of the functions that have been queued up for running
-// after the request has finished processing.
-func (r *request) finalize() error {
+// Requests returns the number of requests that each cache has received. The
+// last index in the output is the number of requests received by the processor.
+// So, for example, the miss rate for the first cache in c is r[len(r)-1] / r[0],
+// where r is the result of ths function.
+func (c *Cache) Requests() []int {
+	c.requestLock.Lock()
+	out := make([]int, len(c.requests))
+	copy(out, c.requests)
+	defer c.requestLock.Unlock()
+	return out
+}
+
+// ProcessFunc defines the format of functions that can be used to process
+// a request payload and return a resultPayload.
+type ProcessFunc func(ctx context.Context, requestPayload interface{}) (resultPayload interface{}, err error)
+
+// Request holds information about a request that is to be handled either by
+// a cache or a ProcessFunc.
+type Request struct {
+	ctx            context.Context
+	requestPayload interface{}
+	resultPayload  interface{}
+	requestChan    chan *Request
+	returnChan     chan *Request
+	err            error
+	funcs          []func(*Request)
+	key            string
+}
+
+// NewRequest creates a new request where requestPayload is the input data
+// that will be used to generate the results and key is a unique key.
+func (c *Cache) NewRequest(ctx context.Context, requestPayload interface{}, key string) *Request {
+	return &Request{
+		requestPayload: requestPayload,
+		returnChan:     make(chan *Request),
+		requestChan:    c.requestChan,
+		key:            key,
+		ctx:            ctx,
+	}
+}
+
+// Process sends the request for processing, waits for the result, and returns
+// the result and any errors that occured while
+// processing.
+func (r *Request) Result() (interface{}, error) {
+	r.requestChan <- r
+	rr := <-r.returnChan
+	return rr.resultPayload, rr.finalize()
+}
+
+// finalize runs any clean-up functions that need to be run after the results
+// have been generated and returns whether any errors have occured.
+func (r *Request) finalize() error {
 	if r.err != nil {
 		return r.err
 	}
-	for _, f := range r.funcs {
+	for len(r.funcs) > 0 {
+		f := r.funcs[0]
+		r.funcs = r.funcs[1:len(r.funcs)]
 		f(r)
 		if r.err != nil {
 			return r.err
@@ -66,129 +129,132 @@ func (r *request) finalize() error {
 	return r.err
 }
 
-// deDuplicate avoids duplicating requests.
-func deDuplicate(in chan *request) <-chan *request {
-	out := make(chan *request)
-	var dupLock sync.Mutex
-	runningTasks := make(map[string][]*request)
+// A CacheFunc can be used to store request results in a cache.
+type CacheFunc func(in chan *Request) (out chan *Request)
 
-	dupFunc := func(req *request) {
-		dupLock.Lock()
-		reqs := runningTasks[req.key]
-		firstReq := reqs[0]
-		for i := 1; i < len(reqs); i++ {
-			reqs[i].returnChan <- firstReq
-		}
-		delete(runningTasks, req.key)
-		dupLock.Unlock()
-	}
+// Deduplicate avoids duplicating requests.
+func Deduplicate() CacheFunc {
+	return func(in chan *Request) chan *Request {
+		out := make(chan *Request)
+		var dupLock sync.Mutex
+		runningTasks := make(map[string][]*Request)
 
-	go func() {
-		for req := range in {
-			if _, ok := runningTasks[req.key]; ok {
-				// This task is currently running, so add it to the queue.
-				runningTasks[req.key] = append(runningTasks[req.key], req)
-			} else {
-				// This task is not currently running, so add it to the beginning of the
-				// queue and pass it on.
-				dupLock.Lock()
-				runningTasks[req.key] = []*request{req}
-				dupLock.Unlock()
-				req.funcs = append(req.funcs, dupFunc)
-				out <- req
+		dupFunc := func(req *Request) {
+			dupLock.Lock()
+			reqs := runningTasks[req.key]
+			for i := 1; i < len(reqs); i++ {
+				reqs[i].returnChan <- req
 			}
+			delete(runningTasks, req.key)
+			dupLock.Unlock()
 		}
-	}()
-	return out
+
+		go func() {
+			for req := range in {
+				if _, ok := runningTasks[req.key]; ok {
+					// This task is currently running, so add it to the queue.
+					runningTasks[req.key] = append(runningTasks[req.key], req)
+				} else {
+					// This task is not currently running, so add it to the beginning of the
+					// queue and pass it on.
+					dupLock.Lock()
+					runningTasks[req.key] = []*Request{req}
+					dupLock.Unlock()
+					req.funcs = append(req.funcs, dupFunc)
+					out <- req
+				}
+			}
+		}()
+		return out
+	}
 }
 
-// memoryCache manages an in-memory cache of results.
-func memoryCache(in <-chan *request) <-chan *request {
-	out := make(chan *request)
-	const maxEntries = 50 // max number of items in the cache
-	cache := lru.New(maxEntries)
+// Memory manages an in-memory cache of results, where maxEntries is the
+// max number of items in the cache. If the results returned by this cache
+// are modified by the caller, they may also be modified in the cache.
+func Memory(maxEntries int) CacheFunc {
+	return func(in chan *Request) chan *Request {
+		out := make(chan *Request)
+		cache := lru.New(maxEntries)
 
-	// cacheFunc adds the data to the cache and is sent along
-	// with the request if the data is not in the cache
-	cacheFunc := func(req *request) {
-		cache.Add(req.key, req.result)
-	}
-
-	go func() {
-		for req := range in {
-			if d, ok := cache.Get(req.key); ok {
-				// If the item is in the cache, return it
-				req.result = d
-				req.returnChan <- req
-			} else {
-				// otherwise, add the request to the cache and send the request along.
-				req.funcs = append(req.funcs, cacheFunc)
-				out <- req
-			}
+		// cacheFunc adds the data to the cache and is sent along
+		// with the request if the data is not in the cache
+		cacheFunc := func(req *Request) {
+			cache.Add(req.key, req.resultPayload)
 		}
-	}()
-	return out
+
+		go func() {
+			for req := range in {
+				if d, ok := cache.Get(req.key); ok {
+					// If the item is in the cache, return it
+					req.resultPayload = d
+					req.returnChan <- req
+				} else {
+					// otherwise, add the request to the cache and send the request along.
+					req.funcs = append(req.funcs, cacheFunc)
+					out <- req
+				}
+			}
+		}()
+		return out
+	}
 }
 
-// diskCache manages an in-memory cache of results, where dir is the
+// Disk manages an on-disk cache of results, where dir is the
 // directory in which to store results
-func diskCache(in <-chan *request, dir string) <-chan *request {
+func Disk(dir string) CacheFunc {
+	return func(in chan *Request) chan *Request {
 
-	// These are the data types that will be saved in the cache.
-	gob.Register(sparse.SparseArray{})
-	gob.Register(sparse.DenseArray{})
-	gob.Register(map[string][]float64{})
+		out := make(chan *Request)
 
-	out := make(chan *request)
-
-	// This function writes the data to the disk after it is
-	// created, and is sent along with the request if the data is
-	// not in the cache.
-	writeFunc := func(req *request) {
-		fname := filepath.Join(dir, req.key+".gob")
-		w, err := os.Create(fname)
-		if err != nil {
-			req.err = err
-			return
-		}
-		defer w.Close()
-		enc := gob.NewEncoder(w)
-		err = enc.Encode(&req.result)
-		if err != nil {
-			req.err = err
-		}
-	}
-
-	go func() {
-		for req := range in {
+		// This function writes the data to the disk after it is
+		// created, and is sent along with the request if the data is
+		// not in the cache.
+		writeFunc := func(req *Request) {
 			fname := filepath.Join(dir, req.key+".gob")
-
-			f, err := os.Open(fname)
+			w, err := os.Create(fname)
 			if err != nil {
-				// If we can't open the file, assume that it doesn't exist and Pass
-				// the request on.
-				req.funcs = append(req.funcs, writeFunc)
-				out <- req
-				continue
+				req.err = err
+				return
 			}
-			var data interface{}
-			dec := gob.NewDecoder(f)
-			if err := dec.Decode(&data); err != nil {
-				// There is some problem with the file. Pass the request on to
-				// recreate it.
-				log.Println("error decoding from disk cache: ", err)
-				req.funcs = append(req.funcs, writeFunc)
-				out <- req
-				continue
-			}
-			if err := f.Close(); err != nil {
+			defer w.Close()
+			enc := gob.NewEncoder(w)
+			err = enc.Encode(&req.resultPayload)
+			if err != nil {
 				req.err = err
 			}
-			// Successfully retrieved the result. Now add it to the request
-			// so it is stored in the cache and return it to the requester.
-			req.result = data
-			req.returnChan <- req
 		}
-	}()
-	return out
+
+		go func() {
+			for req := range in {
+				fname := filepath.Join(dir, req.key+".gob")
+
+				f, err := os.Open(fname)
+				if err != nil {
+					// If we can't open the file, assume that it doesn't exist and Pass
+					// the request on.
+					req.funcs = append(req.funcs, writeFunc)
+					out <- req
+					continue
+				}
+				var data interface{}
+				dec := gob.NewDecoder(f)
+				if err := dec.Decode(&data); err != nil {
+					// There is some problem with the file. Pass the request on to
+					// recreate it.
+					req.funcs = append(req.funcs, writeFunc)
+					out <- req
+					continue
+				}
+				if err := f.Close(); err != nil {
+					req.err = err
+				}
+				// Successfully retrieved the result. Now add it to the request
+				// so it is stored in the cache and return it to the requester.
+				req.resultPayload = data
+				req.returnChan <- req
+			}
+		}()
+		return out
+	}
 }

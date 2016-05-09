@@ -1,10 +1,10 @@
 package requestcache
 
 import (
+	"fmt"
 	"golang.org/x/net/context"
 	"os"
 	"reflect"
-	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -16,7 +16,7 @@ func TestDeDuplicate(t *testing.T) {
 		return 2, nil
 	}
 
-	c := NewCache(p, Deduplicate())
+	c := NewCache(p, 2, Deduplicate())
 
 	var wg sync.WaitGroup
 	wg.Add(10)
@@ -45,7 +45,7 @@ func TestMemory(t *testing.T) {
 		return 2, nil
 	}
 
-	c := NewCache(p, Memory(5))
+	c := NewCache(p, 2, Memory(5))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), 2, "xxx")
@@ -68,7 +68,7 @@ func TestDisk(t *testing.T) {
 		return 2, nil
 	}
 
-	c := NewCache(p, Disk("."))
+	c := NewCache(p, 2, Disk("."))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), 2, "xxx")
@@ -93,7 +93,7 @@ func TestCombined(t *testing.T) {
 		return 2, nil
 	}
 
-	c := NewCache(p, Memory(5), Disk("."))
+	c := NewCache(p, 2, Memory(5), Disk("."))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), 2, "xxx")
@@ -118,13 +118,13 @@ func TestCombinedError(t *testing.T) {
 		return 2, fmt.Errorf("test error")
 	}
 
-	c := NewCache(p, Memory(5), Disk("."))
+	c := NewCache(p, 2, Memory(5), Disk("."))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), 2, "xxx")
 		_, err := r.Result()
 		if err.Error() != "test error" {
-			t.Errorf("error should be 'test error' but is instead %v",err)
+			t.Errorf("error should be 'test error' but is instead %v", err)
 		}
 	}
 	requestsExpected := []int{10, 10, 10}

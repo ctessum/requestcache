@@ -23,9 +23,10 @@ type Cache struct {
 }
 
 // NewCache creates a new set of caches for on-demand generated content, where
-// processor is the function that creates the content and cachefuncs are the
-// caches, listed in order of priority.
-func NewCache(processor ProcessFunc, cachefuncs ...CacheFunc) *Cache {
+// processor is the function that creates the content, numProcessors is the
+// number of processors that will be working in parallel, and cachefuncs are the
+// caches to be used, listed in order of priority.
+func NewCache(processor ProcessFunc, numProcessors int, cachefuncs ...CacheFunc) *Cache {
 	c := &Cache{
 		requestChan: make(chan *Request),
 		requests:    make([]int, len(cachefuncs)+1),
@@ -49,16 +50,18 @@ func NewCache(processor ProcessFunc, cachefuncs ...CacheFunc) *Cache {
 		out = cf(intermediate)
 		in = out
 	}
-	go func() {
-		for req := range out {
-			// Process the results
-			c.requestLock.Lock()
-			c.requests[len(cachefuncs)]++
-			c.requestLock.Unlock()
-			req.resultPayload, req.err = processor(req.ctx, req.requestPayload)
-			req.returnChan <- req
-		}
-	}()
+	for i := 0; i < numProcessors; i++ {
+		go func() {
+			for req := range out {
+				// Process the results
+				c.requestLock.Lock()
+				c.requests[len(cachefuncs)]++
+				c.requestLock.Unlock()
+				req.resultPayload, req.err = processor(req.ctx, req.requestPayload)
+				req.returnChan <- req
+			}
+		}()
+	}
 
 	return c
 }

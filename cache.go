@@ -12,6 +12,7 @@ import (
 	"golang.org/x/net/context"
 )
 
+// Cache is a holder for one or multiple caches.
 type Cache struct {
 	// requestChan receives incoming requests.
 	requestChan chan *Request
@@ -201,7 +202,7 @@ func Memory(maxEntries int) CacheFunc {
 }
 
 // Disk manages an on-disk cache of results, where dir is the
-// directory in which to store results
+// directory in which to store results.
 func Disk(dir string) CacheFunc {
 	return func(in chan *Request) chan *Request {
 

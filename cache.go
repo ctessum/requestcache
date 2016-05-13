@@ -17,7 +17,7 @@ type Cache struct {
 	// requestChan receives incoming requests.
 	requestChan chan *Request
 
-	// requests holds the number of requests each individual cache has recieved.
+	// requests holds the number of requests each individual cache has received.
 	requests    []int
 	requestLock sync.RWMutex
 }
@@ -108,7 +108,7 @@ func (c *Cache) NewRequest(ctx context.Context, requestPayload interface{}, key 
 }
 
 // Process sends the request for processing, waits for the result, and returns
-// the result and any errors that occured while
+// the result and any errors that occurred while
 // processing.
 func (r *Request) Result() (interface{}, error) {
 	r.requestChan <- r
@@ -117,7 +117,7 @@ func (r *Request) Result() (interface{}, error) {
 }
 
 // finalize runs any clean-up functions that need to be run after the results
-// have been generated and returns whether any errors have occured.
+// have been generated and returns whether any errors have occurred.
 func (r *Request) finalize() error {
 	if r.err != nil {
 		return r.err

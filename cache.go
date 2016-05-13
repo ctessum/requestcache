@@ -69,7 +69,7 @@ func NewCache(processor ProcessFunc, numProcessors int, cachefuncs ...CacheFunc)
 // Requests returns the number of requests that each cache has received. The
 // last index in the output is the number of requests received by the processor.
 // So, for example, the miss rate for the first cache in c is r[len(r)-1] / r[0],
-// where r is the result of ths function.
+// where r is the result of this function.
 func (c *Cache) Requests() []int {
 	c.requestLock.Lock()
 	out := make([]int, len(c.requests))

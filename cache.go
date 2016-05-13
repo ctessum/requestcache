@@ -107,7 +107,7 @@ func (c *Cache) NewRequest(ctx context.Context, requestPayload interface{}, key 
 	}
 }
 
-// Process sends the request for processing, waits for the result, and returns
+// Result sends the request for processing, waits for the result, and returns
 // the result and any errors that occurred while
 // processing.
 func (r *Request) Result() (interface{}, error) {

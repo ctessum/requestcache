@@ -155,16 +155,17 @@ func Deduplicate() CacheFunc {
 
 		go func() {
 			for req := range in {
+				dupLock.Lock()
 				if _, ok := runningTasks[req.key]; ok {
 					// This task is currently running, so add it to the queue.
 					runningTasks[req.key] = append(runningTasks[req.key], req)
+					dupLock.Unlock()
 				} else {
 					// This task is not currently running, so add it to the beginning of the
 					// queue and pass it on.
-					dupLock.Lock()
 					runningTasks[req.key] = []*Request{req}
-					dupLock.Unlock()
 					req.funcs = append(req.funcs, dupFunc)
+					dupLock.Unlock()
 					out <- req
 				}
 			}

@@ -2,7 +2,9 @@
 package requestcache
 
 import (
+	"bytes"
 	"encoding/gob"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sync"
@@ -205,9 +207,38 @@ func Memory(maxEntries int) CacheFunc {
 	}
 }
 
+// MarshalGob marshals an interface to a byte array and fulfills
+// the requirements for the Disk cache marshalFunc input.
+func MarshalGob(data interface{}) ([]byte, error) {
+	w := bytes.NewBuffer(nil)
+	e := gob.NewEncoder(w)
+	if err := e.Encode(data); err != nil {
+		return nil, err
+	}
+	return w.Bytes(), nil
+}
+
+// UnmarshalGob unmarshals an interface from a byte array and fulfills
+// the requirements for the Disk cache unmarshalFunc input.
+func UnmarshalGob(b []byte) (interface{}, error) {
+	r := bytes.NewBuffer(b)
+	d := gob.NewDecoder(r)
+	var data interface{}
+	if err := d.Decode(&data); err != nil {
+		return nil, err
+	}
+	return data, nil
+}
+
+// FileExtension is appended to request key names to make
+// up the names of files being written to disk.
+var FileExtension = ".dat"
+
 // Disk manages an on-disk cache of results, where dir is the
-// directory in which to store results.
-func Disk(dir string) CacheFunc {
+// directory in which to store results, marshalFunc is the function to
+// be used to marshal the data object to binary form, and unmarshalFunc
+// is the function to be used to unmarshal the data from binary form.
+func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFunc func([]byte) (interface{}, error)) CacheFunc {
 	return func(in chan *Request) chan *Request {
 
 		out := make(chan *Request)
@@ -216,23 +247,27 @@ func Disk(dir string) CacheFunc {
 		// created, and is sent along with the request if the data is
 		// not in the cache.
 		writeFunc := func(req *Request) {
-			fname := filepath.Join(dir, req.key+".gob")
+			fname := filepath.Join(dir, req.key+FileExtension)
 			w, err := os.Create(fname)
 			if err != nil {
 				req.err = err
 				return
 			}
 			defer w.Close()
-			enc := gob.NewEncoder(w)
-			err = enc.Encode(&req.resultPayload)
+			b, err := marshalFunc(&req.resultPayload)
 			if err != nil {
 				req.err = err
+				return
+			}
+			if _, err = w.Write(b); err != nil {
+				req.err = err
+				return
 			}
 		}
 
 		go func() {
 			for req := range in {
-				fname := filepath.Join(dir, req.key+".gob")
+				fname := filepath.Join(dir, req.key+FileExtension)
 
 				f, err := os.Open(fname)
 				if err != nil {
@@ -242,9 +277,16 @@ func Disk(dir string) CacheFunc {
 					out <- req
 					continue
 				}
-				var data interface{}
-				dec := gob.NewDecoder(f)
-				if err := dec.Decode(&data); err != nil {
+				b, err := ioutil.ReadAll(f)
+				if err != nil {
+					// If we can't read the file, assume that there is some problem with
+					// it and pass the request on.
+					req.funcs = append(req.funcs, writeFunc)
+					out <- req
+					continue
+				}
+				data, err := unmarshalFunc(b)
+				if err != nil {
 					// There is some problem with the file. Pass the request on to
 					// recreate it.
 					req.funcs = append(req.funcs, writeFunc)

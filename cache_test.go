@@ -2,12 +2,13 @@ package requestcache
 
 import (
 	"fmt"
-	"golang.org/x/net/context"
 	"os"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/context"
 )
 
 func TestDeDuplicate(t *testing.T) {
@@ -68,7 +69,7 @@ func TestDisk(t *testing.T) {
 		return 2, nil
 	}
 
-	c := NewCache(p, 2, Disk("."))
+	c := NewCache(p, 2, Disk(".", MarshalGob, UnmarshalGob))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), 2, "xxx")
@@ -85,7 +86,7 @@ func TestDisk(t *testing.T) {
 		t.Errorf("number of requests expected be %v but was %v", requestsExpected, c.Requests())
 	}
 	// remove cached file.
-	os.Remove("xxx.gob")
+	os.Remove("xxx.dat")
 }
 
 func TestCombined(t *testing.T) {
@@ -93,7 +94,7 @@ func TestCombined(t *testing.T) {
 		return 2, nil
 	}
 
-	c := NewCache(p, 2, Memory(5), Disk("."))
+	c := NewCache(p, 2, Memory(5), Disk(".", MarshalGob, UnmarshalGob))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), 2, "xxx")
@@ -110,7 +111,7 @@ func TestCombined(t *testing.T) {
 		t.Errorf("number of requests expected be %v but was %v", requestsExpected, c.Requests())
 	}
 	// remove cached file.
-	os.Remove("xxx.gob")
+	os.Remove("xxx.dat")
 }
 
 func TestCombinedError(t *testing.T) {
@@ -118,7 +119,7 @@ func TestCombinedError(t *testing.T) {
 		return 2, fmt.Errorf("test error")
 	}
 
-	c := NewCache(p, 2, Memory(5), Disk("."))
+	c := NewCache(p, 2, Memory(5), Disk(".", MarshalGob, UnmarshalGob))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), 2, "xxx")
@@ -132,5 +133,5 @@ func TestCombinedError(t *testing.T) {
 		t.Errorf("number of requests expected be %v but was %v", requestsExpected, c.Requests())
 	}
 	// remove cached file.
-	os.Remove("xxx.gob")
+	os.Remove("xxx.dat")
 }

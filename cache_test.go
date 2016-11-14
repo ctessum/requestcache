@@ -1,14 +1,13 @@
 package requestcache
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"reflect"
 	"sync"
 	"testing"
 	"time"
-
-	"golang.org/x/net/context"
 )
 
 func TestDeDuplicate(t *testing.T) {

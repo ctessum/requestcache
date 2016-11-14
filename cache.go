@@ -3,6 +3,7 @@ package requestcache
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
 	"io/ioutil"
 	"os"
@@ -10,8 +11,6 @@ import (
 	"sync"
 
 	"github.com/golang/groupcache/lru"
-
-	"golang.org/x/net/context"
 )
 
 // Cache is a holder for one or multiple caches.

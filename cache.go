@@ -278,22 +278,22 @@ func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFu
 				}
 				b, err := ioutil.ReadAll(f)
 				if err != nil {
-					// If we can't read the file, assume that there is some problem with
-					// it and pass the request on.
-					req.funcs = append(req.funcs, writeFunc)
-					out <- req
+					// We can't read the file.
+					req.err = err
+					req.returnChan <- req
 					continue
 				}
 				data, err := unmarshalFunc(b)
 				if err != nil {
-					// There is some problem with the file. Pass the request on to
-					// recreate it.
-					req.funcs = append(req.funcs, writeFunc)
-					out <- req
+					// There is some problem with the file.
+					req.err = err
+					req.returnChan <- req
 					continue
 				}
 				if err := f.Close(); err != nil {
 					req.err = err
+					req.returnChan <- req
+					continue
 				}
 				// Successfully retrieved the result. Now add it to the request
 				// so it is stored in the cache and return it to the requester.

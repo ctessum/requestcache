@@ -182,16 +182,22 @@ func Memory(maxEntries int) CacheFunc {
 	return func(in chan *Request) chan *Request {
 		out := make(chan *Request)
 		cache := lru.New(maxEntries)
+		var mx sync.RWMutex
 
 		// cacheFunc adds the data to the cache and is sent along
 		// with the request if the data is not in the cache
 		cacheFunc := func(req *Request) {
+			mx.Lock()
+			defer mx.Unlock()
 			cache.Add(req.key, req.resultPayload)
 		}
 
 		go func() {
 			for req := range in {
-				if d, ok := cache.Get(req.key); ok {
+				mx.RLock()
+				d, ok := cache.Get(req.key)
+				mx.RUnlock()
+				if ok {
 					// If the item is in the cache, return it
 					req.resultPayload = d
 					req.returnChan <- req

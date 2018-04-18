@@ -5,7 +5,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
+	"fmt"
 	"io/ioutil"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
@@ -297,6 +299,68 @@ func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFu
 					continue
 				}
 				if err := f.Close(); err != nil {
+					req.err = err
+					req.returnChan <- req
+					continue
+				}
+				// Successfully retrieved the result. Now add it to the request
+				// so it is stored in the cache and return it to the requester.
+				req.resultPayload = data
+				req.returnChan <- req
+			}
+		}()
+		return out
+	}
+}
+
+// HTTP retrieves cached requests over an HTTP connection, where addr is the
+// address where results are stored and unmarshalFunc
+// is the function to be used to unmarshal the data from binary form.
+// This function does not cache requests, it only retrieves previously cached
+// requests.
+func HTTP(addr string, unmarshalFunc func([]byte) (interface{}, error)) CacheFunc {
+	return func(in chan *Request) chan *Request {
+
+		out := make(chan *Request)
+
+		go func() {
+			for req := range in {
+				fname := addr + "/" + req.key + FileExtension
+
+				response, err := http.Get(fname)
+				if err != nil {
+					// If we don't get a response from the server, return an error.
+					req.err = fmt.Errorf(response.Status)
+					req.returnChan <- req
+					continue
+				}
+
+				if response.StatusCode != 200 { // Check if the status is 'ok'.
+					if response.StatusCode == 404 {
+						// If we get a "not found" error, pass the request on.
+						out <- req
+						continue
+						// If we get a different status, return an error.
+						req.err = fmt.Errorf(response.Status)
+						req.returnChan <- req
+						continue
+					}
+				}
+				b, err := ioutil.ReadAll(response.Body)
+				if err != nil {
+					// We can't read the file.
+					req.err = err
+					req.returnChan <- req
+					continue
+				}
+				data, err := unmarshalFunc(b)
+				if err != nil {
+					// There is some problem with the file.
+					req.err = err
+					req.returnChan <- req
+					continue
+				}
+				if err := response.Body.Close(); err != nil {
 					req.err = err
 					req.returnChan <- req
 					continue

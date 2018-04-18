@@ -3,6 +3,7 @@ package requestcache
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"reflect"
 	"sync"
@@ -86,6 +87,67 @@ func TestDisk(t *testing.T) {
 	}
 	// remove cached file.
 	os.Remove("xxx.dat")
+}
+
+func TestHTTP(t *testing.T) {
+	p := func(ctx context.Context, r interface{}) (interface{}, error) {
+		return 2, nil
+	}
+
+	// First, cache a result to disk.
+	c := NewCache(p, 2, Disk(".", MarshalGob, UnmarshalGob))
+	r := c.NewRequest(context.Background(), 2, "yyy")
+	result, err := r.Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.(int) != 2 {
+		t.Fatalf("disk cache result should be 2 but is %d", result.(int))
+	}
+
+	// Create a local server for our saved result.
+	const addr = "http://localhost"
+	const port = ":7070"
+	s := &http.Server{
+		Addr:    port,
+		Handler: http.FileServer(http.Dir(".")),
+	}
+	go func() {
+		s.ListenAndServe()
+	}()
+	defer s.Shutdown(context.Background())
+
+	// Now, test our HTTP cache.
+	c = NewCache(p, 2, HTTP(addr+port, UnmarshalGob))
+	for i := 0; i < 10; i++ {
+		r := c.NewRequest(context.Background(), 2, "yyy")
+		result, err := r.Result()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.(int) != 2 {
+			t.Errorf("HTTP cache result should be 2 but is %d", result.(int))
+		}
+	}
+
+	// Make sure the HTTP cache caught all 10 requests.
+	requestsExpected := []int{10, 0}
+	if !reflect.DeepEqual(c.Requests(), requestsExpected) {
+		t.Errorf("number of requests expected be %v but was %v", requestsExpected, c.Requests())
+	}
+
+	// Check what happens when we request a non-existent file
+	result, err = c.NewRequest(context.Background(), 2, "qqqq").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestsExpected = []int{11, 1} // The cache shouldn't catch this request.
+	if !reflect.DeepEqual(c.Requests(), requestsExpected) {
+		t.Errorf("number of requests expected be %v but was %v", requestsExpected, c.Requests())
+	}
+
+	// remove cached file.
+	os.Remove("yyy.dat")
 }
 
 func TestCombined(t *testing.T) {

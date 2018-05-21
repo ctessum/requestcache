@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"reflect"
 	"sync"
@@ -106,19 +107,10 @@ func TestHTTP(t *testing.T) {
 	}
 
 	// Create a local server for our saved result.
-	const addr = "http://localhost"
-	const port = ":7070"
-	s := &http.Server{
-		Addr:    port,
-		Handler: http.FileServer(http.Dir(".")),
-	}
-	go func() {
-		s.ListenAndServe()
-	}()
-	defer s.Shutdown(context.Background())
+	s := httptest.NewServer(http.FileServer(http.Dir(".")))
 
 	// Now, test our HTTP cache.
-	c = NewCache(p, 2, HTTP(addr+port, UnmarshalGob))
+	c = NewCache(p, 2, HTTP(s.URL, UnmarshalGob))
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), 2, "yyy")
 		result, err := r.Result()

@@ -340,6 +340,7 @@ func HTTP(addr string, unmarshalFunc func([]byte) (interface{}, error)) CacheFun
 						// If we get a "not found" error, pass the request on.
 						out <- req
 						continue
+					} else {
 						// If we get a different status, return an error.
 						req.err = fmt.Errorf(response.Status)
 						req.returnChan <- req

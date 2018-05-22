@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"cloud.google.com/go/storage"
 	"github.com/golang/groupcache/lru"
 )
 
@@ -374,4 +375,80 @@ func HTTP(addr string, unmarshalFunc func([]byte) (interface{}, error)) CacheFun
 		}()
 		return out
 	}
+}
+
+// GoogleCloudStorage manages an cache of results in Google Cloud Storage,
+// where bucket is the bucket in which to store results, subdir is the
+// bucket subdirectory, if any, that should be used, marshalFunc is
+// the function to
+// be used to marshal the data object to binary form, and unmarshalFunc
+// is the function to be used to unmarshal the data from binary form.
+func GoogleCloudStorage(ctx context.Context, bucket, subdir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFunc func([]byte) (interface{}, error)) (CacheFunc, error) {
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	bkt := client.Bucket(bucket)
+	return func(in chan *Request) chan *Request {
+		out := make(chan *Request)
+
+		// This function writes the data to the disk after it is
+		// created, and is sent along with the request if the data is
+		// not in the cache.
+		writeFunc := func(req *Request) {
+			obj := bkt.Object(subdir + "/" + req.key + FileExtension)
+			w := obj.NewWriter(req.ctx)
+			defer w.Close()
+			b, err := marshalFunc(&req.resultPayload)
+			if err != nil {
+				req.err = err
+				return
+			}
+			if _, err = w.Write(b); err != nil {
+				req.err = err
+				return
+			}
+		}
+
+		go func() {
+			for req := range in {
+				obj := bkt.Object(subdir + "/" + req.key + FileExtension)
+				f, err := obj.NewReader(req.ctx)
+				if err != nil {
+					if err == storage.ErrObjectNotExist {
+						req.funcs = append(req.funcs, writeFunc)
+						out <- req
+						continue
+					}
+					req.err = err
+					req.returnChan <- req
+					continue
+				}
+				b, err := ioutil.ReadAll(f)
+				if err != nil {
+					// We can't read the file.
+					req.err = err
+					req.returnChan <- req
+					continue
+				}
+				data, err := unmarshalFunc(b)
+				if err != nil {
+					// There is some problem with the file.
+					req.err = err
+					req.returnChan <- req
+					continue
+				}
+				if err := f.Close(); err != nil {
+					req.err = err
+					req.returnChan <- req
+					continue
+				}
+				// Successfully retrieved the result. Now add it to the request
+				// so it is stored in the cache and return it to the requester.
+				req.resultPayload = data
+				req.returnChan <- req
+			}
+		}()
+		return out
+	}, nil
 }

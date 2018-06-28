@@ -61,7 +61,11 @@ func NewCache(processor ProcessFunc, numProcessors int, cachefuncs ...CacheFunc)
 				c.requestLock.Lock()
 				c.requests[len(cachefuncs)]++
 				c.requestLock.Unlock()
-				req.resultPayload, req.err = processor(req.ctx, req.requestPayload)
+				var err error
+				req.resultPayload, err = processor(req.ctx, req.requestPayload)
+				if err != nil {
+					req.errs = append(req.errs, err)
+				}
 				req.returnChan <- req
 			}
 		}()
@@ -94,7 +98,7 @@ type Request struct {
 	resultPayload  interface{}
 	requestChan    chan *Request
 	returnChan     chan *Request
-	err            error
+	errs           []error
 	funcs          []func(*Request)
 	key            string
 }
@@ -121,20 +125,17 @@ func (r *Request) Result() (interface{}, error) {
 }
 
 // finalize runs any clean-up functions that need to be run after the results
-// have been generated and returns whether any errors have occurred.
+// have been generated and returns the first of any errors have may have occurred.
 func (r *Request) finalize() error {
-	if r.err != nil {
-		return r.err
-	}
 	for len(r.funcs) > 0 {
 		f := r.funcs[0]
 		r.funcs = r.funcs[1:len(r.funcs)]
 		f(r)
-		if r.err != nil {
-			return r.err
-		}
 	}
-	return r.err
+	if len(r.errs) > 0 {
+		return r.errs[0]
+	}
+	return nil
 }
 
 // A CacheFunc can be used to store request results in a cache.
@@ -190,6 +191,9 @@ func Memory(maxEntries int) CacheFunc {
 		// cacheFunc adds the data to the cache and is sent along
 		// with the request if the data is not in the cache
 		cacheFunc := func(req *Request) {
+			if len(req.errs) > 0 {
+				return
+			}
 			mx.Lock()
 			defer mx.Unlock()
 			cache.Add(req.key, req.resultPayload)
@@ -255,20 +259,23 @@ func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFu
 		// created, and is sent along with the request if the data is
 		// not in the cache.
 		writeFunc := func(req *Request) {
+			if len(req.errs) > 0 {
+				return
+			}
 			fname := filepath.Join(dir, req.key+FileExtension)
 			w, err := os.Create(fname)
 			if err != nil {
-				req.err = err
+				req.errs = append(req.errs, err)
 				return
 			}
 			defer w.Close()
 			b, err := marshalFunc(&req.resultPayload)
 			if err != nil {
-				req.err = err
+				req.errs = append(req.errs, err)
 				return
 			}
 			if _, err = w.Write(b); err != nil {
-				req.err = err
+				req.errs = append(req.errs, err)
 				return
 			}
 		}
@@ -288,19 +295,19 @@ func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFu
 				b, err := ioutil.ReadAll(f)
 				if err != nil {
 					// We can't read the file.
-					req.err = err
+					req.errs = append(req.errs, err)
 					req.returnChan <- req
 					continue
 				}
 				data, err := unmarshalFunc(b)
 				if err != nil {
 					// There is some problem with the file.
-					req.err = err
+					req.errs = append(req.errs, err)
 					req.returnChan <- req
 					continue
 				}
 				if err := f.Close(); err != nil {
-					req.err = err
+					req.errs = append(req.errs, err)
 					req.returnChan <- req
 					continue
 				}
@@ -331,7 +338,7 @@ func HTTP(addr string, unmarshalFunc func([]byte) (interface{}, error)) CacheFun
 				response, err := http.Get(fname)
 				if err != nil {
 					// If we don't get a response from the server, return an error.
-					req.err = fmt.Errorf(response.Status)
+					req.errs = append(req.errs, fmt.Errorf(response.Status))
 					req.returnChan <- req
 					continue
 				}
@@ -343,7 +350,7 @@ func HTTP(addr string, unmarshalFunc func([]byte) (interface{}, error)) CacheFun
 						continue
 					} else {
 						// If we get a different status, return an error.
-						req.err = fmt.Errorf(response.Status)
+						req.errs = append(req.errs, fmt.Errorf(response.Status))
 						req.returnChan <- req
 						continue
 					}
@@ -351,19 +358,19 @@ func HTTP(addr string, unmarshalFunc func([]byte) (interface{}, error)) CacheFun
 				b, err := ioutil.ReadAll(response.Body)
 				if err != nil {
 					// We can't read the file.
-					req.err = err
+					req.errs = append(req.errs, err)
 					req.returnChan <- req
 					continue
 				}
 				data, err := unmarshalFunc(b)
 				if err != nil {
 					// There is some problem with the file.
-					req.err = err
+					req.errs = append(req.errs, err)
 					req.returnChan <- req
 					continue
 				}
 				if err := response.Body.Close(); err != nil {
-					req.err = err
+					req.errs = append(req.errs, err)
 					req.returnChan <- req
 					continue
 				}
@@ -396,16 +403,19 @@ func GoogleCloudStorage(ctx context.Context, bucket, subdir string, marshalFunc 
 		// created, and is sent along with the request if the data is
 		// not in the cache.
 		writeFunc := func(req *Request) {
+			if len(req.errs) > 0 {
+				return
+			}
 			obj := bkt.Object(subdir + "/" + req.key + FileExtension)
 			w := obj.NewWriter(req.ctx)
 			defer w.Close()
 			b, err := marshalFunc(&req.resultPayload)
 			if err != nil {
-				req.err = err
+				req.errs = append(req.errs, err)
 				return
 			}
 			if _, err = w.Write(b); err != nil {
-				req.err = err
+				req.errs = append(req.errs, err)
 				return
 			}
 		}
@@ -420,26 +430,26 @@ func GoogleCloudStorage(ctx context.Context, bucket, subdir string, marshalFunc 
 						out <- req
 						continue
 					}
-					req.err = err
+					req.errs = append(req.errs, err)
 					req.returnChan <- req
 					continue
 				}
 				b, err := ioutil.ReadAll(f)
 				if err != nil {
 					// We can't read the file.
-					req.err = err
+					req.errs = append(req.errs, err)
 					req.returnChan <- req
 					continue
 				}
 				data, err := unmarshalFunc(b)
 				if err != nil {
 					// There is some problem with the file.
-					req.err = err
+					req.errs = append(req.errs, err)
 					req.returnChan <- req
 					continue
 				}
 				if err := f.Close(); err != nil {
-					req.err = err
+					req.errs = append(req.errs, err)
 					req.returnChan <- req
 					continue
 				}

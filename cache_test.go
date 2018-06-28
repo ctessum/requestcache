@@ -172,16 +172,16 @@ func TestCombinedError(t *testing.T) {
 		return 2, fmt.Errorf("test error")
 	}
 
-	c := NewCache(p, 2, Memory(5), Disk(".", MarshalGob, UnmarshalGob))
+	c := NewCache(p, 2, Deduplicate(), Memory(5), Disk(".", MarshalGob, UnmarshalGob))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), 2, "xxx")
 		_, err := r.Result()
-		if err.Error() != "test error" {
-			t.Errorf("error should be 'test error' but is instead %v", err)
+		if err == nil || err.Error() != "test error" {
+			t.Errorf("try %d; error should be 'test error' but is instead %v", i, err)
 		}
 	}
-	requestsExpected := []int{10, 10, 10}
+	requestsExpected := []int{10, 10, 10, 10}
 	if !reflect.DeepEqual(c.Requests(), requestsExpected) {
 		t.Errorf("number of requests expected be %v but was %v", requestsExpected, c.Requests())
 	}

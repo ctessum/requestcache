@@ -2,6 +2,7 @@ package requestcache
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestDeDuplicate(t *testing.T) {
@@ -71,6 +74,42 @@ func TestDisk(t *testing.T) {
 	}
 
 	c := NewCache(p, 2, Disk(".", MarshalGob, UnmarshalGob))
+
+	for i := 0; i < 10; i++ {
+		r := c.NewRequest(context.Background(), 2, "xxx")
+		result, err := r.Result()
+		if err != nil {
+			t.Error(err)
+		}
+		if result.(int) != 2 {
+			t.Errorf("result should be 2 but is %d", result.(int))
+		}
+	}
+	requestsExpected := []int{10, 1}
+	if !reflect.DeepEqual(c.Requests(), requestsExpected) {
+		t.Errorf("number of requests expected be %v but was %v", requestsExpected, c.Requests())
+	}
+	// remove cached file.
+	os.Remove("xxx.dat")
+}
+
+func TestSQLITE(t *testing.T) {
+	p := func(ctx context.Context, r interface{}) (interface{}, error) {
+		return 2, nil
+	}
+
+	db, err := sql.Open("sqlite3", "testdb.sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove("testdb.sqlite3")
+
+	sqlCache, err := SQL(context.Background(), db, MarshalGob, UnmarshalGob)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewCache(p, 2, sqlCache)
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), 2, "xxx")

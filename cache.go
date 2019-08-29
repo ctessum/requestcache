@@ -4,6 +4,7 @@ package requestcache
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/gob"
 	"fmt"
 	"io/ioutil"
@@ -319,6 +320,83 @@ func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFu
 		}()
 		return out
 	}
+}
+
+// SQL manages a cache of results in an SQL database, where dir is the
+// directory in which to store results, marshalFunc is the function to
+// be used to marshal the data object to binary form, and unmarshalFunc
+// is the function to be used to unmarshal the data from binary form.
+func SQL(ctx context.Context, db *sql.DB, marshalFunc func(interface{}) ([]byte, error), unmarshalFunc func([]byte) (interface{}, error)) (CacheFunc, error) {
+	_, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS cache (
+	key TEXT PRIMARY KEY,
+	data BLOB NOT NULL
+);`)
+	if err != nil {
+		return nil, fmt.Errorf("requestcache: preparing database: %v", err)
+	}
+	writeStmt, err := db.PrepareContext(ctx, `INSERT INTO cache (key,data) VALUES(?,?);`)
+	if err != nil {
+		return nil, fmt.Errorf("requestcache: preparing database: %v", err)
+	}
+	readStmt, err := db.PrepareContext(ctx, `SELECT data from cache WHERE key = ?;`)
+	if err != nil {
+		return nil, fmt.Errorf("requestcache: preparing database: %v", err)
+	}
+
+	// This function writes the data to the disk after it is
+	// created, and is sent along with the request if the data is
+	// not in the cache.
+	writeFunc := func(req *Request) {
+		if len(req.errs) > 0 {
+			return
+		}
+		b, err := marshalFunc(&req.resultPayload)
+		if err != nil {
+			req.errs = append(req.errs, err)
+			return
+		}
+		_, err = writeStmt.ExecContext(req.ctx, req.key, b)
+		if err != nil {
+			req.errs = append(req.errs, fmt.Errorf("requestcache: writing data to SQL: %v", err))
+			return
+		}
+	}
+
+	return func(in chan *Request) chan *Request {
+		out := make(chan *Request)
+
+		go func() {
+			for req := range in {
+				row := readStmt.QueryRowContext(req.ctx, req.key)
+				var b []byte
+				err := row.Scan(&b)
+				if err == sql.ErrNoRows {
+					// Data doesn't doesn't exist: pass
+					// the request on.
+					req.funcs = append(req.funcs, writeFunc)
+					out <- req
+					continue
+				} else if err != nil {
+					// We can't read the file.
+					req.errs = append(req.errs, err)
+					req.returnChan <- req
+					continue
+				}
+				data, err := unmarshalFunc(b)
+				if err != nil {
+					// There is some problem with the data.
+					req.errs = append(req.errs, err)
+					req.returnChan <- req
+					continue
+				}
+				// Successfully retrieved the result. Now add it to the request
+				// so it is stored in the cache and return it to the requester.
+				req.resultPayload = data
+				req.returnChan <- req
+			}
+		}()
+		return out
+	}, nil
 }
 
 // HTTP retrieves cached requests over an HTTP connection, where addr is the

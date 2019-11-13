@@ -322,8 +322,8 @@ func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFu
 	}
 }
 
-// SQL manages a cache of results in an SQL database, where dir is the
-// directory in which to store results, marshalFunc is the function to
+// SQL manages a cache of results in an SQL database,
+// where db is the database connection, marshalFunc is the function to
 // be used to marshal the data object to binary form, and unmarshalFunc
 // is the function to be used to unmarshal the data from binary form.
 func SQL(ctx context.Context, db *sql.DB, marshalFunc func(interface{}) ([]byte, error), unmarshalFunc func([]byte) (interface{}, error)) (CacheFunc, error) {
@@ -334,6 +334,10 @@ func SQL(ctx context.Context, db *sql.DB, marshalFunc func(interface{}) ([]byte,
 	if err != nil {
 		return nil, fmt.Errorf("requestcache: preparing database: %v", err)
 	}
+	if _, err := db.ExecContext(ctx, `CREATE UNIQUE INDEX cache_key ON cache(key);`); err != nil {
+		return nil, fmt.Errorf("requestcache: preparing database index: %v", err)
+	}
+
 	writeStmt, err := db.PrepareContext(ctx, `INSERT INTO cache (key,data) VALUES(?,?);`)
 	if err != nil {
 		return nil, fmt.Errorf("requestcache: preparing database: %v", err)

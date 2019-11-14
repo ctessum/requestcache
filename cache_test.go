@@ -15,19 +15,35 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+type job struct {
+	run func() (interface{}, error)
+	key string
+}
+
+func (j *job) Run(ctx context.Context) (interface{}, error) {
+	return j.run()
+}
+
+func (j *job) Key() string {
+	return j.key
+}
+
 func TestDeDuplicate(t *testing.T) {
-	p := func(ctx context.Context, r interface{}) (interface{}, error) {
-		time.Sleep(10 * time.Millisecond)
-		return 2, nil
+	j := &job{
+		run: func() (interface{}, error) {
+			time.Sleep(10 * time.Millisecond)
+			return 2, nil
+		},
+		key: "xxx",
 	}
 
-	c := NewCache(p, 2, Deduplicate())
+	c := NewCache(2, Deduplicate())
 
 	var wg sync.WaitGroup
 	wg.Add(10)
 	for i := 0; i < 10; i++ {
 		go func(i int) {
-			r := c.NewRequest(context.Background(), 2, "xxx")
+			r := c.NewRequest(context.Background(), j)
 			result, err := r.Result()
 			if err != nil {
 				t.Error(err)
@@ -46,14 +62,17 @@ func TestDeDuplicate(t *testing.T) {
 }
 
 func TestMemory(t *testing.T) {
-	p := func(ctx context.Context, r interface{}) (interface{}, error) {
-		return 2, nil
+	j := &job{
+		run: func() (interface{}, error) {
+			return 2, nil
+		},
+		key: "xxx",
 	}
 
-	c := NewCache(p, 2, Memory(5))
+	c := NewCache(2, Memory(5))
 
 	for i := 0; i < 10; i++ {
-		r := c.NewRequest(context.Background(), 2, "xxx")
+		r := c.NewRequest(context.Background(), j)
 		result, err := r.Result()
 		if err != nil {
 			t.Error(err)
@@ -69,14 +88,17 @@ func TestMemory(t *testing.T) {
 }
 
 func TestDisk(t *testing.T) {
-	p := func(ctx context.Context, r interface{}) (interface{}, error) {
-		return 2, nil
+	j := &job{
+		run: func() (interface{}, error) {
+			return 2, nil
+		},
+		key: "xxx",
 	}
 
-	c := NewCache(p, 2, Disk(".", MarshalGob, UnmarshalGob))
+	c := NewCache(2, Disk(".", MarshalGob, UnmarshalGob))
 
 	for i := 0; i < 10; i++ {
-		r := c.NewRequest(context.Background(), 2, "xxx")
+		r := c.NewRequest(context.Background(), j)
 		result, err := r.Result()
 		if err != nil {
 			t.Error(err)
@@ -94,8 +116,11 @@ func TestDisk(t *testing.T) {
 }
 
 func TestSQLITE(t *testing.T) {
-	p := func(ctx context.Context, r interface{}) (interface{}, error) {
-		return 2, nil
+	j := &job{
+		run: func() (interface{}, error) {
+			return 2, nil
+		},
+		key: "xxx",
 	}
 
 	db, err := sql.Open("sqlite3", "testdb.sqlite3")
@@ -109,10 +134,10 @@ func TestSQLITE(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := NewCache(p, 2, sqlCache)
+	c := NewCache(2, sqlCache)
 
 	for i := 0; i < 10; i++ {
-		r := c.NewRequest(context.Background(), 2, "xxx")
+		r := c.NewRequest(context.Background(), j)
 		result, err := r.Result()
 		if err != nil {
 			t.Error(err)
@@ -130,13 +155,16 @@ func TestSQLITE(t *testing.T) {
 }
 
 func TestHTTP(t *testing.T) {
-	p := func(ctx context.Context, r interface{}) (interface{}, error) {
-		return 2, nil
+	j := &job{
+		run: func() (interface{}, error) {
+			return 2, nil
+		},
+		key: "yyy",
 	}
 
 	// First, cache a result to disk.
-	c := NewCache(p, 2, Disk(".", MarshalGob, UnmarshalGob))
-	r := c.NewRequest(context.Background(), 2, "yyy")
+	c := NewCache(2, Disk(".", MarshalGob, UnmarshalGob))
+	r := c.NewRequest(context.Background(), j)
 	result, err := r.Result()
 	if err != nil {
 		t.Fatal(err)
@@ -149,9 +177,9 @@ func TestHTTP(t *testing.T) {
 	s := httptest.NewServer(http.FileServer(http.Dir(".")))
 
 	// Now, test our HTTP cache.
-	c = NewCache(p, 2, HTTP(s.URL, UnmarshalGob))
+	c = NewCache(2, HTTP(s.URL, UnmarshalGob))
 	for i := 0; i < 10; i++ {
-		r := c.NewRequest(context.Background(), 2, "yyy")
+		r := c.NewRequest(context.Background(), j)
 		result, err := r.Result()
 		if err != nil {
 			t.Fatal(err)
@@ -168,7 +196,8 @@ func TestHTTP(t *testing.T) {
 	}
 
 	// Check what happens when we request a non-existent file
-	result, err = c.NewRequest(context.Background(), 2, "qqqq").Result()
+	j.key = "qqqq"
+	result, err = c.NewRequest(context.Background(), j).Result()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,14 +211,17 @@ func TestHTTP(t *testing.T) {
 }
 
 func TestCombined(t *testing.T) {
-	p := func(ctx context.Context, r interface{}) (interface{}, error) {
-		return 2, nil
+	j := &job{
+		run: func() (interface{}, error) {
+			return 2, nil
+		},
+		key: "xxx",
 	}
 
-	c := NewCache(p, 2, Memory(5), Disk(".", MarshalGob, UnmarshalGob))
+	c := NewCache(2, Memory(5), Disk(".", MarshalGob, UnmarshalGob))
 
 	for i := 0; i < 10; i++ {
-		r := c.NewRequest(context.Background(), 2, "xxx")
+		r := c.NewRequest(context.Background(), j)
 		result, err := r.Result()
 		if err != nil {
 			t.Error(err)
@@ -207,14 +239,17 @@ func TestCombined(t *testing.T) {
 }
 
 func TestCombinedError(t *testing.T) {
-	p := func(ctx context.Context, r interface{}) (interface{}, error) {
-		return 2, fmt.Errorf("test error")
+	j := &job{
+		run: func() (interface{}, error) {
+			return 2, fmt.Errorf("test error")
+		},
+		key: "xxx",
 	}
 
-	c := NewCache(p, 2, Deduplicate(), Memory(5), Disk(".", MarshalGob, UnmarshalGob))
+	c := NewCache(2, Deduplicate(), Memory(5), Disk(".", MarshalGob, UnmarshalGob))
 
 	for i := 0; i < 10; i++ {
-		r := c.NewRequest(context.Background(), 2, "xxx")
+		r := c.NewRequest(context.Background(), j)
 		_, err := r.Result()
 		if err == nil || err.Error() != "test error" {
 			t.Errorf("try %d; error should be 'test error' but is instead %v", i, err)

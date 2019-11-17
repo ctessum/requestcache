@@ -1,4 +1,4 @@
-module github.com/ctessum/requestcache/v2
+module github.com/ctessum/requestcache/v3
 
 go 1.12
 

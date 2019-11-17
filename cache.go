@@ -2,15 +2,15 @@
 package requestcache
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
-	"encoding/gob"
+	"encoding"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 
 	"cloud.google.com/go/storage"
@@ -30,11 +30,16 @@ type Cache struct {
 // A job specifies a unit of work to be run and cached with a
 // unique key.
 type Job interface {
-	// Run runs the job and returns the result.
-	Run(context.Context) (interface{}, error)
+	// Run runs the job and fills the provided result.
+	Run(context.Context, Result) error
 
 	// Key returns a unique identifier for this job.
 	Key() string
+}
+
+type Result interface {
+	encoding.BinaryMarshaler
+	encoding.BinaryUnmarshaler
 }
 
 // NewCache creates a new set of caches for on-demand generated content, where
@@ -72,8 +77,7 @@ func NewCache(numProcessors int, cachefuncs ...CacheFunc) *Cache {
 				c.requestLock.Lock()
 				c.requests[len(cachefuncs)]++
 				c.requestLock.Unlock()
-				var err error
-				req.resultPayload, err = req.job.Run(req.ctx)
+				err := req.job.Run(req.ctx, req.resultPayload)
 				if err != nil {
 					req.errs = append(req.errs, err)
 				}
@@ -97,16 +101,12 @@ func (c *Cache) Requests() []int {
 	return out
 }
 
-// ProcessFunc defines the format of functions that can be used to process
-// a request payload and return a resultPayload.
-type ProcessFunc func(ctx context.Context, requestPayload interface{}) (resultPayload interface{}, err error)
-
 // Request holds information about a request that is to be handled either by
 // a cache or a ProcessFunc.
 type Request struct {
 	ctx           context.Context
 	job           Job
-	resultPayload interface{}
+	resultPayload Result
 	requestChan   chan *Request
 	returnChan    chan *Request
 	errs          []error
@@ -123,13 +123,13 @@ func (c *Cache) NewRequest(ctx context.Context, job Job) *Request {
 	}
 }
 
-// Result sends the request for processing, waits for the result, and returns
-// the result and any errors that occurred while
-// processing.
-func (r *Request) Result() (interface{}, error) {
+// Result sends the request for processing and fills the provided result
+// variable.
+func (r *Request) Result(result Result) error {
+	r.resultPayload = result
 	r.requestChan <- r
 	rr := <-r.returnChan
-	return rr.resultPayload, rr.finalize()
+	return rr.finalize()
 }
 
 // finalize runs any clean-up functions that need to be run after the results
@@ -146,6 +146,12 @@ func (r *Request) finalize() error {
 	return nil
 }
 
+// setPayload fills the payload of the reciever with the specified
+// result.
+func (r *Request) setPayload(res Result) {
+	reflect.ValueOf(r.resultPayload).Elem().Set(reflect.ValueOf(res).Elem())
+}
+
 // A CacheFunc can be used to store request results in a cache.
 type CacheFunc func(in chan *Request) (out chan *Request)
 
@@ -160,7 +166,8 @@ func Deduplicate() CacheFunc {
 			dupLock.Lock()
 			reqs := runningTasks[req.job.Key()]
 			for i := 1; i < len(reqs); i++ {
-				reqs[i].returnChan <- req
+				reqs[i].setPayload(req.resultPayload)
+				reqs[i].returnChan <- reqs[i]
 			}
 			delete(runningTasks, req.job.Key())
 			dupLock.Unlock()
@@ -214,7 +221,7 @@ func Memory(maxEntries int) CacheFunc {
 				mx.RUnlock()
 				if ok {
 					// If the item is in the cache, return it
-					req.resultPayload = d
+					req.setPayload(d.(Result))
 					req.returnChan <- req
 				} else {
 					// otherwise, add the request to the cache and send the request along.
@@ -227,38 +234,13 @@ func Memory(maxEntries int) CacheFunc {
 	}
 }
 
-// MarshalGob marshals an interface to a byte array and fulfills
-// the requirements for the Disk cache marshalFunc input.
-func MarshalGob(data interface{}) ([]byte, error) {
-	w := bytes.NewBuffer(nil)
-	e := gob.NewEncoder(w)
-	if err := e.Encode(data); err != nil {
-		return nil, err
-	}
-	return w.Bytes(), nil
-}
-
-// UnmarshalGob unmarshals an interface from a byte array and fulfills
-// the requirements for the Disk cache unmarshalFunc input.
-func UnmarshalGob(b []byte) (interface{}, error) {
-	r := bytes.NewBuffer(b)
-	d := gob.NewDecoder(r)
-	var data interface{}
-	if err := d.Decode(&data); err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
 // FileExtension is appended to request key names to make
 // up the names of files being written to disk.
 var FileExtension = ".dat"
 
 // Disk manages an on-disk cache of results, where dir is the
-// directory in which to store results, marshalFunc is the function to
-// be used to marshal the data object to binary form, and unmarshalFunc
-// is the function to be used to unmarshal the data from binary form.
-func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFunc func([]byte) (interface{}, error)) CacheFunc {
+// directory in which to store results.
+func Disk(dir string) CacheFunc {
 	return func(in chan *Request) chan *Request {
 
 		out := make(chan *Request)
@@ -277,7 +259,7 @@ func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFu
 				return
 			}
 			defer w.Close()
-			b, err := marshalFunc(&req.resultPayload)
+			b, err := req.resultPayload.MarshalBinary()
 			if err != nil {
 				req.errs = append(req.errs, err)
 				return
@@ -307,8 +289,7 @@ func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFu
 					req.returnChan <- req
 					continue
 				}
-				data, err := unmarshalFunc(b)
-				if err != nil {
+				if err := req.resultPayload.UnmarshalBinary(b); err != nil {
 					// There is some problem with the file.
 					req.errs = append(req.errs, err)
 					req.returnChan <- req
@@ -319,9 +300,7 @@ func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFu
 					req.returnChan <- req
 					continue
 				}
-				// Successfully retrieved the result. Now add it to the request
-				// so it is stored in the cache and return it to the requester.
-				req.resultPayload = data
+				// Successfully retrieved the result. Now return it to the requester.
 				req.returnChan <- req
 			}
 		}()
@@ -330,10 +309,8 @@ func Disk(dir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFu
 }
 
 // SQL manages a cache of results in an SQL database,
-// where db is the database connection, marshalFunc is the function to
-// be used to marshal the data object to binary form, and unmarshalFunc
-// is the function to be used to unmarshal the data from binary form.
-func SQL(ctx context.Context, db *sql.DB, marshalFunc func(interface{}) ([]byte, error), unmarshalFunc func([]byte) (interface{}, error)) (CacheFunc, error) {
+// where db is the database connection.
+func SQL(ctx context.Context, db *sql.DB) (CacheFunc, error) {
 	_, err := db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS cache (
 	key TEXT PRIMARY KEY,
 	data BLOB NOT NULL
@@ -361,7 +338,7 @@ func SQL(ctx context.Context, db *sql.DB, marshalFunc func(interface{}) ([]byte,
 		if len(req.errs) > 0 {
 			return
 		}
-		b, err := marshalFunc(&req.resultPayload)
+		b, err := req.resultPayload.MarshalBinary()
 		if err != nil {
 			req.errs = append(req.errs, err)
 			return
@@ -393,16 +370,13 @@ func SQL(ctx context.Context, db *sql.DB, marshalFunc func(interface{}) ([]byte,
 					req.returnChan <- req
 					continue
 				}
-				data, err := unmarshalFunc(b)
-				if err != nil {
+				if err := req.resultPayload.UnmarshalBinary(b); err != nil {
 					// There is some problem with the data.
 					req.errs = append(req.errs, err)
 					req.returnChan <- req
 					continue
 				}
-				// Successfully retrieved the result. Now add it to the request
-				// so it is stored in the cache and return it to the requester.
-				req.resultPayload = data
+				// Successfully retrieved the result. Now return it to the requester.
 				req.returnChan <- req
 			}
 		}()
@@ -411,11 +385,10 @@ func SQL(ctx context.Context, db *sql.DB, marshalFunc func(interface{}) ([]byte,
 }
 
 // HTTP retrieves cached requests over an HTTP connection, where addr is the
-// address where results are stored and unmarshalFunc
-// is the function to be used to unmarshal the data from binary form.
+// address where results are stored.
 // This function does not cache requests, it only retrieves previously cached
 // requests.
-func HTTP(addr string, unmarshalFunc func([]byte) (interface{}, error)) CacheFunc {
+func HTTP(addr string) CacheFunc {
 	return func(in chan *Request) chan *Request {
 
 		out := make(chan *Request)
@@ -451,8 +424,7 @@ func HTTP(addr string, unmarshalFunc func([]byte) (interface{}, error)) CacheFun
 					req.returnChan <- req
 					continue
 				}
-				data, err := unmarshalFunc(b)
-				if err != nil {
+				if err := req.resultPayload.UnmarshalBinary(b); err != nil {
 					// There is some problem with the file.
 					req.errs = append(req.errs, err)
 					req.returnChan <- req
@@ -463,9 +435,7 @@ func HTTP(addr string, unmarshalFunc func([]byte) (interface{}, error)) CacheFun
 					req.returnChan <- req
 					continue
 				}
-				// Successfully retrieved the result. Now add it to the request
-				// so it is stored in the cache and return it to the requester.
-				req.resultPayload = data
+				// Successfully retrieved the result. Now return it to the requester.
 				req.returnChan <- req
 			}
 		}()
@@ -474,12 +444,9 @@ func HTTP(addr string, unmarshalFunc func([]byte) (interface{}, error)) CacheFun
 }
 
 // GoogleCloudStorage manages an cache of results in Google Cloud Storage,
-// where bucket is the bucket in which to store results, subdir is the
-// bucket subdirectory, if any, that should be used, marshalFunc is
-// the function to
-// be used to marshal the data object to binary form, and unmarshalFunc
-// is the function to be used to unmarshal the data from binary form.
-func GoogleCloudStorage(ctx context.Context, bucket, subdir string, marshalFunc func(interface{}) ([]byte, error), unmarshalFunc func([]byte) (interface{}, error)) (CacheFunc, error) {
+// where bucket is the bucket in which to store results and subdir is the
+// bucket subdirectory, if any, that should be used.
+func GoogleCloudStorage(ctx context.Context, bucket, subdir string) (CacheFunc, error) {
 	client, err := storage.NewClient(ctx)
 	if err != nil {
 		return nil, err
@@ -498,7 +465,7 @@ func GoogleCloudStorage(ctx context.Context, bucket, subdir string, marshalFunc 
 			obj := bkt.Object(subdir + "/" + req.job.Key() + FileExtension)
 			w := obj.NewWriter(req.ctx)
 			defer w.Close()
-			b, err := marshalFunc(&req.resultPayload)
+			b, err := req.resultPayload.MarshalBinary()
 			if err != nil {
 				req.errs = append(req.errs, err)
 				return
@@ -530,8 +497,7 @@ func GoogleCloudStorage(ctx context.Context, bucket, subdir string, marshalFunc 
 					req.returnChan <- req
 					continue
 				}
-				data, err := unmarshalFunc(b)
-				if err != nil {
+				if err := req.resultPayload.UnmarshalBinary(b); err != nil {
 					// There is some problem with the file.
 					req.errs = append(req.errs, err)
 					req.returnChan <- req
@@ -542,9 +508,7 @@ func GoogleCloudStorage(ctx context.Context, bucket, subdir string, marshalFunc 
 					req.returnChan <- req
 					continue
 				}
-				// Successfully retrieved the result. Now add it to the request
-				// so it is stored in the cache and return it to the requester.
-				req.resultPayload = data
+				// Successfully retrieved the result. Now return it to the requester.
 				req.returnChan <- req
 			}
 		}()

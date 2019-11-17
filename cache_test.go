@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -16,12 +17,36 @@ import (
 )
 
 type job struct {
-	run func() (interface{}, error)
+	run func() (int, error)
 	key string
 }
 
-func (j *job) Run(ctx context.Context) (interface{}, error) {
-	return j.run()
+type result struct {
+	i int
+}
+
+// MarshalBinary marshals a the receiver to a byte array and fulfills
+// the requirements for the Disk cache marshalFunc input.
+func (r *result) MarshalBinary() ([]byte, error) {
+	return []byte(strconv.Itoa(r.i)), nil
+}
+
+// UnmarshalBinary unmarshals the receiver from a byte array and fulfills
+// the requirements for the Disk cache unmarshalFunc input.
+func (r *result) UnmarshalBinary(b []byte) error {
+	var err error
+	r.i, err = strconv.Atoi(string(b))
+	return err
+}
+
+func (j *job) Run(ctx context.Context, r Result) error {
+	i, err := j.run()
+	if err != nil {
+		return err
+	}
+	rr := r.(*result)
+	rr.i = i
+	return nil
 }
 
 func (j *job) Key() string {
@@ -30,7 +55,7 @@ func (j *job) Key() string {
 
 func TestDeDuplicate(t *testing.T) {
 	j := &job{
-		run: func() (interface{}, error) {
+		run: func() (int, error) {
 			time.Sleep(10 * time.Millisecond)
 			return 2, nil
 		},
@@ -44,12 +69,12 @@ func TestDeDuplicate(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		go func(i int) {
 			r := c.NewRequest(context.Background(), j)
-			result, err := r.Result()
-			if err != nil {
+			var res result
+			if err := r.Result(&res); err != nil {
 				t.Error(err)
 			}
-			if result.(int) != 2 {
-				t.Errorf("result should be 2 but is %d", result.(int))
+			if res.i != 2 {
+				t.Errorf("result should be 2 but is %d", res.i)
 			}
 			wg.Done()
 		}(i)
@@ -63,7 +88,7 @@ func TestDeDuplicate(t *testing.T) {
 
 func TestMemory(t *testing.T) {
 	j := &job{
-		run: func() (interface{}, error) {
+		run: func() (int, error) {
 			return 2, nil
 		},
 		key: "xxx",
@@ -73,12 +98,12 @@ func TestMemory(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
-		result, err := r.Result()
-		if err != nil {
+		var res result
+		if err := r.Result(&res); err != nil {
 			t.Error(err)
 		}
-		if result.(int) != 2 {
-			t.Errorf("result should be 2 but is %d", result.(int))
+		if res.i != 2 {
+			t.Errorf("result should be 2 but is %d", res.i)
 		}
 	}
 	requestsExpected := []int{10, 1}
@@ -89,22 +114,22 @@ func TestMemory(t *testing.T) {
 
 func TestDisk(t *testing.T) {
 	j := &job{
-		run: func() (interface{}, error) {
+		run: func() (int, error) {
 			return 2, nil
 		},
 		key: "xxx",
 	}
 
-	c := NewCache(2, Disk(".", MarshalGob, UnmarshalGob))
+	c := NewCache(2, Disk("."))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
-		result, err := r.Result()
-		if err != nil {
+		var res result
+		if err := r.Result(&res); err != nil {
 			t.Error(err)
 		}
-		if result.(int) != 2 {
-			t.Errorf("result should be 2 but is %d", result.(int))
+		if res.i != 2 {
+			t.Errorf("result should be 2 but is %d", res.i)
 		}
 	}
 	requestsExpected := []int{10, 1}
@@ -117,7 +142,7 @@ func TestDisk(t *testing.T) {
 
 func TestSQLITE(t *testing.T) {
 	j := &job{
-		run: func() (interface{}, error) {
+		run: func() (int, error) {
 			return 2, nil
 		},
 		key: "xxx",
@@ -129,7 +154,7 @@ func TestSQLITE(t *testing.T) {
 	}
 	defer os.Remove("testdb.sqlite3")
 
-	sqlCache, err := SQL(context.Background(), db, MarshalGob, UnmarshalGob)
+	sqlCache, err := SQL(context.Background(), db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,12 +163,12 @@ func TestSQLITE(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
-		result, err := r.Result()
-		if err != nil {
+		var res result
+		if err := r.Result(&res); err != nil {
 			t.Error(err)
 		}
-		if result.(int) != 2 {
-			t.Errorf("result should be 2 but is %d", result.(int))
+		if res.i != 2 {
+			t.Errorf("result should be 2 but is %d", res.i)
 		}
 	}
 	requestsExpected := []int{10, 1}
@@ -156,36 +181,36 @@ func TestSQLITE(t *testing.T) {
 
 func TestHTTP(t *testing.T) {
 	j := &job{
-		run: func() (interface{}, error) {
+		run: func() (int, error) {
 			return 2, nil
 		},
 		key: "yyy",
 	}
 
 	// First, cache a result to disk.
-	c := NewCache(2, Disk(".", MarshalGob, UnmarshalGob))
+	c := NewCache(2, Disk("."))
 	r := c.NewRequest(context.Background(), j)
-	result, err := r.Result()
-	if err != nil {
+	var res result
+	if err := r.Result(&res); err != nil {
 		t.Fatal(err)
 	}
-	if result.(int) != 2 {
-		t.Fatalf("disk cache result should be 2 but is %d", result.(int))
+	if res.i != 2 {
+		t.Fatalf("disk cache result should be 2 but is %d", res.i)
 	}
 
 	// Create a local server for our saved result.
 	s := httptest.NewServer(http.FileServer(http.Dir(".")))
 
 	// Now, test our HTTP cache.
-	c = NewCache(2, HTTP(s.URL, UnmarshalGob))
+	c = NewCache(2, HTTP(s.URL))
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
-		result, err := r.Result()
-		if err != nil {
+		var res result
+		if err := r.Result(&res); err != nil {
 			t.Fatal(err)
 		}
-		if result.(int) != 2 {
-			t.Errorf("HTTP cache result should be 2 but is %d", result.(int))
+		if res.i != 2 {
+			t.Errorf("HTTP cache result should be 2 but is %d", res.i)
 		}
 	}
 
@@ -197,8 +222,8 @@ func TestHTTP(t *testing.T) {
 
 	// Check what happens when we request a non-existent file
 	j.key = "qqqq"
-	result, err = c.NewRequest(context.Background(), j).Result()
-	if err != nil {
+	req := c.NewRequest(context.Background(), j)
+	if err := req.Result(&res); err != nil {
 		t.Fatal(err)
 	}
 	requestsExpected = []int{11, 1} // The cache shouldn't catch this request.
@@ -212,22 +237,22 @@ func TestHTTP(t *testing.T) {
 
 func TestCombined(t *testing.T) {
 	j := &job{
-		run: func() (interface{}, error) {
+		run: func() (int, error) {
 			return 2, nil
 		},
 		key: "xxx",
 	}
 
-	c := NewCache(2, Memory(5), Disk(".", MarshalGob, UnmarshalGob))
+	c := NewCache(2, Memory(5), Disk("."))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
-		result, err := r.Result()
-		if err != nil {
+		var res result
+		if err := r.Result(&res); err != nil {
 			t.Error(err)
 		}
-		if result.(int) != 2 {
-			t.Errorf("result should be 2 but is %d", result.(int))
+		if res.i != 2 {
+			t.Errorf("result should be 2 but is %d", res.i)
 		}
 	}
 	requestsExpected := []int{10, 1, 1}
@@ -240,17 +265,18 @@ func TestCombined(t *testing.T) {
 
 func TestCombinedError(t *testing.T) {
 	j := &job{
-		run: func() (interface{}, error) {
+		run: func() (int, error) {
 			return 2, fmt.Errorf("test error")
 		},
 		key: "xxx",
 	}
 
-	c := NewCache(2, Deduplicate(), Memory(5), Disk(".", MarshalGob, UnmarshalGob))
+	c := NewCache(2, Deduplicate(), Memory(5), Disk("."))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
-		_, err := r.Result()
+		var res result
+		err := r.Result(&res)
 		if err == nil || err.Error() != "test error" {
 			t.Errorf("try %d; error should be 'test error' but is instead %v", i, err)
 		}

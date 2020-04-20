@@ -27,7 +27,7 @@ type Cache struct {
 	requestLock sync.RWMutex
 }
 
-// A job specifies a unit of work to be run and cached with a
+// A Job specifies a unit of work to be run and cached with a
 // unique key.
 type Job interface {
 	// Run runs the job and fills the provided result.
@@ -37,16 +37,25 @@ type Job interface {
 	Key() string
 }
 
+// A JobRecursive specifies a unit of work to be run and cached with a
+// unique key, which may include recursive requests for other jobs.
+type JobRecursive interface {
+	// Run runs the job and fills the provided result.
+	Run(context.Context, *Cache, Result) error
+
+	// Key returns a unique identifier for this job.
+	Key() string
+}
+
+// Result specifies the properties of items that can be used to extract results.
 type Result interface {
 	encoding.BinaryMarshaler
 	encoding.BinaryUnmarshaler
 }
 
 // NewCache creates a new set of caches for on-demand generated content, where
-// processor numProcessors is the
-// number of processors that will be working in parallel and cachefuncs are the
-// caches to be used, listed in order of priority.
-func NewCache(numProcessors int, cachefuncs ...CacheFunc) *Cache {
+// cachefuncs specifies the caches to be used, listed in order of priority.
+func NewCache(cachefuncs ...CacheFunc) *Cache {
 	c := &Cache{
 		requestChan: make(chan *Request),
 		requests:    make([]int, len(cachefuncs)+1),
@@ -70,22 +79,28 @@ func NewCache(numProcessors int, cachefuncs ...CacheFunc) *Cache {
 		out = cf(intermediate)
 		in = out
 	}
-	for i := 0; i < numProcessors; i++ {
-		go func() {
-			for req := range out {
+	go func() {
+		for req := range out {
+			go func(req *Request) {
 				// Process the results
 				c.requestLock.Lock()
 				c.requests[len(cachefuncs)]++
 				c.requestLock.Unlock()
-				err := req.job.Run(req.ctx, req.resultPayload)
+				var err error
+				if req.job != nil {
+					err = req.job.Run(req.ctx, req.resultPayload)
+				} else if req.jobRecursive != nil {
+					err = req.jobRecursive.Run(req.ctx, c, req.resultPayload)
+				} else {
+					panic("not possible")
+				}
 				if err != nil {
 					req.errs = append(req.errs, err)
 				}
 				req.returnChan <- req
-			}
-		}()
-	}
-
+			}(req)
+		}
+	}()
 	return c
 }
 
@@ -106,6 +121,7 @@ func (c *Cache) Requests() []int {
 type Request struct {
 	ctx           context.Context
 	job           Job
+	jobRecursive  JobRecursive
 	resultPayload Result
 	requestChan   chan *Request
 	returnChan    chan *Request
@@ -114,6 +130,7 @@ type Request struct {
 }
 
 // NewRequest creates a new request where job is the job to be run.
+// The request is not sent to the queue until the Result method is called.
 func (c *Cache) NewRequest(ctx context.Context, job Job) *Request {
 	return &Request{
 		job:         job,
@@ -121,6 +138,27 @@ func (c *Cache) NewRequest(ctx context.Context, job Job) *Request {
 		requestChan: c.requestChan,
 		ctx:         ctx,
 	}
+}
+
+// NewRequestRecursive creates a new request where job is the job to be run.
+// The request is not sent to the queue until the Result method is called.
+func (c *Cache) NewRequestRecursive(ctx context.Context, job JobRecursive) *Request {
+	return &Request{
+		jobRecursive: job,
+		returnChan:   make(chan *Request),
+		requestChan:  c.requestChan,
+		ctx:          ctx,
+	}
+}
+
+// key returns the key associated with the request.
+func (r *Request) key() string {
+	if r.job != nil {
+		return r.job.Key()
+	} else if r.jobRecursive != nil {
+		return r.jobRecursive.Key()
+	}
+	panic("not possible")
 }
 
 // Result sends the request for processing and fills the provided result
@@ -164,26 +202,26 @@ func Deduplicate() CacheFunc {
 
 		dupFunc := func(req *Request) {
 			dupLock.Lock()
-			reqs := runningTasks[req.job.Key()]
+			reqs := runningTasks[req.key()]
 			for i := 1; i < len(reqs); i++ {
 				reqs[i].setPayload(req.resultPayload)
 				reqs[i].returnChan <- reqs[i]
 			}
-			delete(runningTasks, req.job.Key())
+			delete(runningTasks, req.key())
 			dupLock.Unlock()
 		}
 
 		go func() {
 			for req := range in {
 				dupLock.Lock()
-				if _, ok := runningTasks[req.job.Key()]; ok {
+				if _, ok := runningTasks[req.key()]; ok {
 					// This task is currently running, so add it to the queue.
-					runningTasks[req.job.Key()] = append(runningTasks[req.job.Key()], req)
+					runningTasks[req.key()] = append(runningTasks[req.key()], req)
 					dupLock.Unlock()
 				} else {
 					// This task is not currently running, so add it to the beginning of the
 					// queue and pass it on.
-					runningTasks[req.job.Key()] = []*Request{req}
+					runningTasks[req.key()] = []*Request{req}
 					req.funcs = append(req.funcs, dupFunc)
 					dupLock.Unlock()
 					out <- req
@@ -211,13 +249,13 @@ func Memory(maxEntries int) CacheFunc {
 			}
 			mx.Lock()
 			defer mx.Unlock()
-			cache.Add(req.job.Key(), req.resultPayload)
+			cache.Add(req.key(), req.resultPayload)
 		}
 
 		go func() {
 			for req := range in {
 				mx.RLock()
-				d, ok := cache.Get(req.job.Key())
+				d, ok := cache.Get(req.key())
 				mx.RUnlock()
 				if ok {
 					// If the item is in the cache, return it
@@ -252,7 +290,7 @@ func Disk(dir string) CacheFunc {
 			if len(req.errs) > 0 {
 				return
 			}
-			fname := filepath.Join(dir, req.job.Key()+FileExtension)
+			fname := filepath.Join(dir, req.key()+FileExtension)
 			w, err := os.Create(fname)
 			if err != nil {
 				req.errs = append(req.errs, err)
@@ -272,7 +310,7 @@ func Disk(dir string) CacheFunc {
 
 		go func() {
 			for req := range in {
-				fname := filepath.Join(dir, req.job.Key()+FileExtension)
+				fname := filepath.Join(dir, req.key()+FileExtension)
 
 				f, err := os.Open(fname)
 				if err != nil {
@@ -343,7 +381,7 @@ func SQL(ctx context.Context, db *sql.DB) (CacheFunc, error) {
 			req.errs = append(req.errs, err)
 			return
 		}
-		_, err = writeStmt.ExecContext(req.ctx, req.job.Key(), b)
+		_, err = writeStmt.ExecContext(req.ctx, req.key(), b)
 		if err != nil {
 			req.errs = append(req.errs, fmt.Errorf("requestcache: writing data to SQL: %v", err))
 			return
@@ -355,7 +393,7 @@ func SQL(ctx context.Context, db *sql.DB) (CacheFunc, error) {
 
 		go func() {
 			for req := range in {
-				row := readStmt.QueryRowContext(req.ctx, req.job.Key())
+				row := readStmt.QueryRowContext(req.ctx, req.key())
 				var b []byte
 				err := row.Scan(&b)
 				if err == sql.ErrNoRows {
@@ -395,7 +433,7 @@ func HTTP(addr string) CacheFunc {
 
 		go func() {
 			for req := range in {
-				fname := addr + "/" + req.job.Key() + FileExtension
+				fname := addr + "/" + req.key() + FileExtension
 
 				response, err := http.Get(fname)
 				if err != nil {
@@ -462,7 +500,7 @@ func GoogleCloudStorage(ctx context.Context, bucket, subdir string) (CacheFunc, 
 			if len(req.errs) > 0 {
 				return
 			}
-			obj := bkt.Object(subdir + "/" + req.job.Key() + FileExtension)
+			obj := bkt.Object(subdir + "/" + req.key() + FileExtension)
 			w := obj.NewWriter(req.ctx)
 			defer w.Close()
 			b, err := req.resultPayload.MarshalBinary()
@@ -478,7 +516,7 @@ func GoogleCloudStorage(ctx context.Context, bucket, subdir string) (CacheFunc, 
 
 		go func() {
 			for req := range in {
-				obj := bkt.Object(subdir + "/" + req.job.Key() + FileExtension)
+				obj := bkt.Object(subdir + "/" + req.key() + FileExtension)
 				f, err := obj.NewReader(req.ctx)
 				if err != nil {
 					if err == storage.ErrObjectNotExist {

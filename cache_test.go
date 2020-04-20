@@ -62,7 +62,7 @@ func TestDeDuplicate(t *testing.T) {
 		key: "xxx",
 	}
 
-	c := NewCache(2, Deduplicate())
+	c := NewCache(Deduplicate())
 
 	var wg sync.WaitGroup
 	wg.Add(10)
@@ -94,7 +94,7 @@ func TestMemory(t *testing.T) {
 		key: "xxx",
 	}
 
-	c := NewCache(2, Memory(5))
+	c := NewCache(Memory(5))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
@@ -120,7 +120,7 @@ func TestDisk(t *testing.T) {
 		key: "xxx",
 	}
 
-	c := NewCache(2, Disk("."))
+	c := NewCache(Disk("."))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
@@ -159,7 +159,7 @@ func TestSQLITE(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := NewCache(2, sqlCache)
+	c := NewCache(sqlCache)
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
@@ -188,7 +188,7 @@ func TestHTTP(t *testing.T) {
 	}
 
 	// First, cache a result to disk.
-	c := NewCache(2, Disk("."))
+	c := NewCache(Disk("."))
 	r := c.NewRequest(context.Background(), j)
 	var res result
 	if err := r.Result(&res); err != nil {
@@ -202,7 +202,7 @@ func TestHTTP(t *testing.T) {
 	s := httptest.NewServer(http.FileServer(http.Dir(".")))
 
 	// Now, test our HTTP cache.
-	c = NewCache(2, HTTP(s.URL))
+	c = NewCache(HTTP(s.URL))
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
 		var res result
@@ -243,7 +243,7 @@ func TestCombined(t *testing.T) {
 		key: "xxx",
 	}
 
-	c := NewCache(2, Memory(5), Disk("."))
+	c := NewCache(Memory(5), Disk("."))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
@@ -271,7 +271,7 @@ func TestCombinedError(t *testing.T) {
 		key: "xxx",
 	}
 
-	c := NewCache(2, Deduplicate(), Memory(5), Disk("."))
+	c := NewCache(Deduplicate(), Memory(5), Disk("."))
 
 	for i := 0; i < 10; i++ {
 		r := c.NewRequest(context.Background(), j)
@@ -287,4 +287,62 @@ func TestCombinedError(t *testing.T) {
 	}
 	// remove cached file.
 	os.Remove("xxx.dat")
+}
+
+type jobRecursive struct {
+	i   int
+	key string
+}
+
+func (j *jobRecursive) Run(ctx context.Context, c *Cache, r Result) error {
+	res1 := new(result)
+	res2 := new(result)
+	if j.i < 5 {
+		req1 := c.NewRequestRecursive(ctx, &jobRecursive{j.i + 1, fmt.Sprint(j.key, "-", j.i+1)})
+		if err := req1.Result(res1); err != nil {
+			return err
+		}
+		req2 := c.NewRequestRecursive(ctx, &jobRecursive{j.i + 1, fmt.Sprint(j.key, ";", j.i+1)})
+		if err := req2.Result(res2); err != nil {
+			return err
+		}
+	}
+
+	rr := r.(*result)
+	rr.i = j.i + res1.i + res2.i
+	return nil
+}
+
+func (j *jobRecursive) Key() string {
+	return j.key
+}
+
+func TestCombinedRecursive(t *testing.T) {
+	dirName := "test_combined_recursive"
+	if err := os.Mkdir(dirName, os.ModePerm); err != nil {
+		t.Fatal(err)
+	}
+	j := &jobRecursive{
+		i:   1,
+		key: "1",
+	}
+
+	c := NewCache(Memory(2), Disk(dirName))
+
+	for i := 0; i < 2; i++ {
+		r := c.NewRequestRecursive(context.Background(), j)
+		var res result
+		if err := r.Result(&res); err != nil {
+			t.Error(err)
+		}
+		if res.i != 129 {
+			t.Errorf("result should be 129 but is %d", res.i)
+		}
+	}
+	requestsExpected := []int{32, 31, 31}
+	if !reflect.DeepEqual(c.Requests(), requestsExpected) {
+		t.Errorf("number of requests expected be %v but was %v", requestsExpected, c.Requests())
+	}
+	// remove cached file.
+	os.RemoveAll(dirName)
 }
